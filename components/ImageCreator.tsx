@@ -23,7 +23,7 @@ import piexif from 'piexifjs';
 import { GoogleGenAI, Type } from "@google/genai";
 
 // --- SETUP ---
-const ai = new GoogleGenAI({ apiKey: process.env.API_KEY! });
+const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
 
 // --- TYPES & CONSTANTS ---
 const CATEGORIES: Record<string, string> = {

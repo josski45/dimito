@@ -1,6 +1,9 @@
 import React, { useState, useCallback, useEffect, useRef, DragEvent, ChangeEvent } from 'react';
-import { Video, Wand2, Loader, Download, AlertCircle, Check, X, UploadCloud, PlusCircle, Trash2 } from 'lucide-react';
+import { Video, Wand2, Loader, Download, AlertCircle, Check, X, UploadCloud, Trash2 } from 'lucide-react';
 import { GoogleGenAI } from "@google/genai";
+
+// --- SETUP ---
+const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
 
 // --- TYPES & CONSTANTS ---
 type ToastMessage = {
@@ -60,8 +63,6 @@ export default function VideoCreator() {
     const [toast, setToast] = useState<ToastMessage | null>(null);
     const [loadingMessage, setLoadingMessage] = useState(loadingMessages[0]);
 
-    // New State for advanced features
-    const [apiKeys, setApiKeys] = useState<string[]>(['']);
     const [model, setModel] = useState(VIDEO_MODELS[0]);
     const [numberOfVideos, setNumberOfVideos] = useState(1);
     const [aspectRatio, setAspectRatio] = useState('16:9');
@@ -74,30 +75,6 @@ export default function VideoCreator() {
         setToast({ id: Date.now(), message, type });
     }, []);
 
-    // Load/Save API Keys from localStorage
-    useEffect(() => {
-        try {
-            const storedKeys = localStorage.getItem('genai_video_api_keys');
-            if (storedKeys) {
-                const parsedKeys = JSON.parse(storedKeys);
-                if (Array.isArray(parsedKeys) && parsedKeys.length > 0 && parsedKeys.every(k => typeof k === 'string')) {
-                    setApiKeys(parsedKeys);
-                }
-            }
-        } catch (error) {
-            console.error("Failed to load API keys from localStorage", error);
-        }
-    }, []);
-
-    useEffect(() => {
-        const validKeys = apiKeys.filter(k => k.trim() !== '');
-        if (validKeys.length > 0) {
-            localStorage.setItem('genai_video_api_keys', JSON.stringify(validKeys));
-        } else {
-            localStorage.removeItem('genai_video_api_keys');
-        }
-    }, [apiKeys]);
-    
     // Loading message cycle effect
     useEffect(() => {
         let interval: number;
@@ -114,27 +91,9 @@ export default function VideoCreator() {
             if (interval) clearInterval(interval);
         };
     }, [isGenerating]);
-    
-    const handleApiKeyChange = (index: number, value: string) => {
-        const newKeys = [...apiKeys];
-        newKeys[index] = value;
-        setApiKeys(newKeys);
-    };
-
-    const addApiKey = () => setApiKeys([...apiKeys, '']);
-
-    const removeApiKey = (index: number) => {
-        if (apiKeys.length > 1) {
-            const newKeys = apiKeys.filter((_, i) => i !== index);
-            setApiKeys(newKeys);
-        } else {
-            setApiKeys(['']); // Clear the last key instead of removing it
-        }
-    };
-
 
     const handleGenerateVideo = useCallback(async () => {
-        const promptsToProcess = activeTab === 'single' 
+        const promptsToProcess = activeTab === 'single'
             ? [prompt.trim()]
             : batchInput.split('\n').map(p => p.trim()).filter(Boolean);
 
@@ -143,9 +102,8 @@ export default function VideoCreator() {
             return;
         }
 
-        const validApiKeys = apiKeys.filter(k => k.trim());
-        if (validApiKeys.length === 0 && !process.env.API_KEY) {
-            showToast("Please provide at least one API key.", 'error');
+        if (!process.env.API_KEY) {
+            showToast("API key is missing.", 'error');
             return;
         }
 
@@ -154,95 +112,66 @@ export default function VideoCreator() {
         setLoadingMessage(loadingMessages[0]);
         let totalSuccessCount = 0;
 
-        // Use process.env.API_KEY as a fallback if no keys are provided in the UI
-        const keysToTry = validApiKeys.length > 0 ? validApiKeys : [process.env.API_KEY!].filter(Boolean);
-        if (keysToTry.length === 0) {
-            showToast("API key is missing.", 'error');
-            setIsGenerating(false);
-            return;
-        }
-
         for (const [index, currentPrompt] of promptsToProcess.entries()) {
             showToast(`Processing prompt ${index + 1} of ${promptsToProcess.length}...`, 'info');
-            let promptSuccess = false;
-
-            for (const key of keysToTry) {
-                try {
-                    const ai = new GoogleGenAI({ apiKey: key });
-
-                    const params: any = {
-                        model,
-                        prompt: currentPrompt,
-                        config: { 
-                            numberOfVideos,
-                            aspectRatio
-                        }
+            try {
+                const params: any = {
+                    model,
+                    prompt: currentPrompt,
+                    config: {
+                        numberOfVideos,
+                        aspectRatio
+                    }
+                };
+                if (inputImage) {
+                    params.image = {
+                        imageBytes: inputImage.split(',')[1],
+                        mimeType: inputImage.match(/data:(.*);base64,/)?.[1] || 'image/jpeg',
                     };
-                    if (inputImage) {
-                        params.image = {
-                            imageBytes: inputImage.split(',')[1],
-                            mimeType: inputImage.match(/data:(.*);base64,/)?.[1] || 'image/jpeg',
-                        };
-                    }
-                    
-                    let operation = await ai.models.generateVideos(params);
-                    showToast("Video generation started for current prompt. This can take several minutes.", 'info');
-
-                    while (!operation.done) {
-                        await new Promise(resolve => setTimeout(resolve, 10000)); // Poll every 10 seconds
-                        operation = await ai.operations.getVideosOperation({ operation: operation });
-                    }
-
-                    const videoUris = operation.response?.generatedVideos?.map(v => v.video?.uri).filter(Boolean) as string[];
-                    
-                    if (!videoUris || videoUris.length === 0) {
-                        throw new Error("Video generation completed, but no download link was found.");
-                    }
-
-                    showToast(`Fetching ${videoUris.length} generated video(s) for prompt ${index + 1}...`, 'info');
-
-                    const fetchedUrls = await Promise.all(
-                        videoUris.map(async (uri) => {
-                            const response = await fetch(`${uri}&key=${key}`);
-                            if (!response.ok) {
-                                throw new Error(`Failed to fetch video: ${response.statusText}`);
-                            }
-                            const videoBlob = await response.blob();
-                            return URL.createObjectURL(videoBlob);
-                        })
-                    );
-                    
-                    setGeneratedVideos(prev => [...prev, ...fetchedUrls]);
-                    showToast(`Prompt ${index + 1} completed successfully!`, 'success');
-                    totalSuccessCount++;
-                    promptSuccess = true;
-                    break; // Exit key loop on success for this prompt
-
-                } catch (error) {
-                    console.error(`Video generation failed with key ...${key.slice(-4)} for prompt "${currentPrompt.substring(0,20)}...":`, error);
-                    const message = error instanceof Error ? error.message : "An unknown error occurred";
-
-                    const isQuotaError = message.toLowerCase().includes('quota') || message.includes('429');
-                    if (isQuotaError && keysToTry.indexOf(key) < keysToTry.length - 1) {
-                        showToast(`Key ...${key.slice(-4)} failed (quota?). Trying next key...`, 'info');
-                    } else {
-                         showToast(`Error on prompt ${index + 1}: ${message}`, 'error');
-                        // If it's the last key or not a quota error, we stop trying for this prompt.
-                        promptSuccess = false;
-                        break; 
-                    }
                 }
-            } // End of key loop
-             if (!promptSuccess) {
-                showToast(`Failed to generate video for prompt ${index + 1} with all keys.`, 'error');
+
+                let operation = await ai.models.generateVideos(params);
+                showToast("Video generation started for current prompt. This can take several minutes.", 'info');
+
+                while (!operation.done) {
+                    await new Promise(resolve => setTimeout(resolve, 10000)); // Poll every 10 seconds
+                    operation = await ai.operations.getVideosOperation({ operation: operation });
+                }
+
+                const videoUris = operation.response?.generatedVideos?.map(v => v.video?.uri).filter(Boolean) as string[];
+
+                if (!videoUris || videoUris.length === 0) {
+                    throw new Error("Video generation completed, but no download link was found.");
+                }
+
+                showToast(`Fetching ${videoUris.length} generated video(s) for prompt ${index + 1}...`, 'info');
+
+                const fetchedUrls = await Promise.all(
+                    videoUris.map(async (uri) => {
+                        const response = await fetch(`${uri}&key=${process.env.API_KEY}`);
+                        if (!response.ok) {
+                            throw new Error(`Failed to fetch video: ${response.statusText}`);
+                        }
+                        const videoBlob = await response.blob();
+                        return URL.createObjectURL(videoBlob);
+                    })
+                );
+
+                setGeneratedVideos(prev => [...prev, ...fetchedUrls]);
+                showToast(`Prompt ${index + 1} completed successfully!`, 'success');
+                totalSuccessCount++;
+            } catch (error) {
+                console.error(`Video generation failed for prompt "${currentPrompt.substring(0, 20)}...":`, error);
+                const message = error instanceof Error ? error.message : "An unknown error occurred";
+                showToast(`Error on prompt ${index + 1}: ${message}`, 'error');
             }
         } // End of prompt loop
-        
+
         showToast(`Batch finished. ${totalSuccessCount}/${promptsToProcess.length} prompts succeeded.`, totalSuccessCount > 0 ? 'success' : 'error');
         setIsGenerating(false);
 
-    }, [prompt, batchInput, activeTab, apiKeys, model, numberOfVideos, inputImage, showToast, aspectRatio]);
-    
+    }, [prompt, batchInput, activeTab, model, numberOfVideos, inputImage, showToast, aspectRatio]);
+
     const handleSurpriseMe = () => {
         const inspirations = [
             "A majestic eagle soaring over a misty mountain range at sunrise.",
@@ -372,27 +301,6 @@ export default function VideoCreator() {
                                 <label htmlFor="video-count" className="block text-sm font-medium text-slate-300 mb-1">Videos per Prompt ({numberOfVideos})</label>
                                 <input id="video-count" type="range" min="1" max="4" value={numberOfVideos} onChange={e => setNumberOfVideos(parseInt(e.target.value))} className="w-full h-2 bg-slate-700 rounded-lg appearance-none cursor-pointer" />
                              </div>
-                        </div>
-
-                        {/* API KEYS */}
-                        <div className="space-y-3 pt-4 border-t border-slate-700">
-                            <h3 className="text-lg font-semibold">API Keys</h3>
-                            <p className="text-xs text-slate-400">Keys are saved in your browser. The app will try them in order if one fails.</p>
-                            {apiKeys.map((key, index) => (
-                                <div key={index} className="flex gap-2 items-center">
-                                    <input
-                                        type="password"
-                                        placeholder={`API Key ${index + 1}`}
-                                        value={key}
-                                        onChange={(e) => handleApiKeyChange(index, e.target.value)}
-                                        className="w-full bg-slate-900 border border-slate-600 rounded-md p-2 focus:ring-2 focus:ring-sky-500"
-                                    />
-                                    <button onClick={() => removeApiKey(index)} className="p-2 text-slate-400 hover:text-red-400 transition" title="Remove Key"><Trash2 className="w-4 h-4" /></button>
-                                </div>
-                            ))}
-                            <button onClick={addApiKey} className="w-full flex items-center justify-center gap-2 bg-slate-700/50 px-4 py-2 rounded-md hover:bg-slate-700 transition text-sm">
-                                <PlusCircle className="w-4 h-4"/> Add Another Key
-                            </button>
                         </div>
                         
                         {/* GENERATE BUTTON */}
