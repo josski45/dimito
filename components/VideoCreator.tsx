@@ -16,7 +16,7 @@ type ToastMessage = {
     type: 'info' | 'success' | 'error';
 };
 
-const VIDEO_MODELS = ['veo-2.0-generate-001'];
+const VIDEO_MODELS = ['veo-2.0-generate-001', 'veo-2.0-fast-generate-001', 'veo-2.0-ultra-generate-001', 'veo-3.0-generate-preview', 'veo-3.0-fast-generate-preview'];
 const ASPECT_RATIOS = ["16:9", "9:16", "1:1", "4:3", "3:4"];
 
 const loadingMessages = [
@@ -63,6 +63,7 @@ export default function VideoCreator({ apiKeys, getNextAvailableKey, cycleToNext
     const [prompt, setPrompt] = useState('');
     const [batchInput, setBatchInput] = useState('');
     const [isGenerating, setIsGenerating] = useState(false);
+    const [isEnhancing, setIsEnhancing] = useState(false);
     const [generatedVideos, setGeneratedVideos] = useState<string[]>([]);
     const [toast, setToast] = useState<ToastMessage | null>(null);
     const [loadingMessage, setLoadingMessage] = useState(loadingMessages[0]);
@@ -84,6 +85,47 @@ export default function VideoCreator({ apiKeys, getNextAvailableKey, cycleToNext
         const errorString = String(error);
         return errorString.includes("429") || errorMessage.includes('rate limit') || errorMessage.includes('resource_exhausted') || errorMessage.includes('quota');
     };
+
+    const callGeminiApi = useCallback(async (userPrompt: string) => {
+        if (apiKeys.length === 0) {
+            showToast("Please add an API key in the settings.", 'error');
+            throw new Error("No API key available");
+        }
+    
+        const parts = [{ text: userPrompt }];
+
+        for (let i = 0; i < apiKeys.length; i++) {
+            const { key: apiKey } = getNextAvailableKey();
+            if (!apiKey) {
+                showToast("All API keys are on cooldown. Please wait.", 'error');
+                throw new Error("All API keys are on cooldown.");
+            }
+
+            try {
+                const ai = new GoogleGenAI({ apiKey });
+                const response = await ai.models.generateContent({
+                    model: 'gemini-2.5-flash',
+                    contents: { parts },
+                });
+                const text = response.text;
+                if (text === undefined) {
+                    throw new Error("Invalid response structure from Gemini API.");
+                }
+                return text;
+            } catch (error) {
+                if (isRateLimitError(error)) {
+                    showToast(`API key failed, trying next...`, 'info');
+                    cycleToNextKey(apiKey);
+                } else {
+                    const message = error instanceof Error ? error.message : "An unknown error occurred";
+                    showToast(`Gemini API error: ${message}`, 'error');
+                    throw error;
+                }
+            }
+        }
+        showToast("All available API keys failed. Please check your keys or wait.", 'error');
+        throw new Error("All available API keys failed.");
+    }, [apiKeys, getNextAvailableKey, cycleToNextKey, showToast]);
 
     // Loading message cycle effect
     useEffect(() => {
@@ -199,18 +241,24 @@ export default function VideoCreator({ apiKeys, getNextAvailableKey, cycleToNext
 
     }, [prompt, batchInput, activeTab, model, numberOfVideos, inputImage, showToast, aspectRatio, apiKeys, getNextAvailableKey, cycleToNextKey]);
 
-    const handleSurpriseMe = () => {
-        const inspirations = [
-            "A majestic eagle soaring over a misty mountain range at sunrise.",
-            "A futuristic city with flying cars and holographic advertisements.",
-            "A time-lapse of a flower blooming, from bud to full blossom.",
-            "An astronaut planting a flag on a newly discovered alien planet with two suns.",
-            "A close-up shot of a honeybee collecting nectar from a vibrant flower.",
-            "A neon hologram of a cat driving at top speed.",
-            "A serene underwater scene with colorful coral reefs and tropical fish."
-        ];
-        setPrompt(inspirations[Math.floor(Math.random() * inspirations.length)]);
-    };
+    const handleSurpriseMe = useCallback(async () => {
+        if (apiKeys.length === 0) {
+            showToast("Please add an API key to use this feature.", 'error');
+            return;
+        }
+        setIsEnhancing(true);
+        try {
+            const surprisePrompt = "Generate one unique, creative, and visually interesting video generation prompt. The prompt should describe a scene with clear motion or a short narrative arc. Return only the prompt text itself, with no extra formatting or labels.";
+            const newPrompt = await callGeminiApi(surprisePrompt);
+            setPrompt(newPrompt.trim().replace(/"/g, ''));
+            showToast("Here's a surprise prompt!", 'info');
+        } catch (error) {
+            // Error toast is already shown by callGeminiApi
+            console.error("Surprise Me failed:", error);
+        } finally {
+            setIsEnhancing(false);
+        }
+    }, [callGeminiApi, showToast, apiKeys.length]);
 
     const handleImageDrop = useCallback((e: DragEvent<HTMLDivElement>) => {
         e.preventDefault();
@@ -265,8 +313,8 @@ export default function VideoCreator({ apiKeys, getNextAvailableKey, cycleToNext
                                     className="w-full bg-slate-900 border border-slate-600 rounded-md p-3 resize-none focus:ring-2 focus:ring-sky-500 focus:border-sky-500 h-32 custom-scrollbar"
                                     disabled={isGenerating}
                                 ></textarea>
-                                <button onClick={handleSurpriseMe} disabled={isGenerating} className="w-full flex items-center justify-center gap-2 bg-slate-700 px-4 py-2 rounded-md hover:bg-slate-600 transition disabled:opacity-50 text-sm">
-                                    <Wand2 className="w-4 h-4"/> Surprise Me
+                                <button onClick={handleSurpriseMe} disabled={isGenerating || isEnhancing || apiKeys.length === 0} className="w-full flex items-center justify-center gap-2 bg-slate-700 px-4 py-2 rounded-md hover:bg-slate-600 transition disabled:opacity-50 text-sm">
+                                    {isEnhancing ? <Loader className="w-4 h-4 animate-spin"/> : <Wand2 className="w-4 h-4"/>} Surprise Me
                                 </button>
                             </div>
                         ) : (
