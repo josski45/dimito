@@ -1,4 +1,3 @@
-/// <reference types="node" />
 import React, { useState, useCallback, useRef, useEffect, ChangeEvent, DragEvent, ClipboardEvent } from 'react';
 import { 
     Image as ImageIcon, 
@@ -288,9 +287,9 @@ export default function ImageCreator() {
         for (let i = 0; i < retries; i++) {
             try {
                 return await apiCall();
-            } catch (error: any) {
-                const errorMessage = (error?.message || '').toLowerCase();
-                const errorString = error.toString();
+            } catch (error) {
+                const errorMessage = error instanceof Error ? error.message.toLowerCase() : String(error).toLowerCase();
+                const errorString = String(error);
                 const isRateLimitError = errorString.includes("429") || errorMessage.includes('rate limit') || errorMessage.includes('resource_exhausted') || errorMessage.includes('quota');
     
                 if (isRateLimitError && i < retries - 1) {
@@ -353,7 +352,7 @@ export default function ImageCreator() {
         }
         parts.push({ text: userPrompt });
     
-        let lastError: any;
+        let lastError: unknown;
 
         for (const model of availableModels) {
             const apiCall = () => ai.models.generateContent({
@@ -379,8 +378,8 @@ export default function ImageCreator() {
                 return text;
             } catch (error) {
                 lastError = error;
-                const errorMessage = (error?.message || '').toLowerCase();
-                const errorString = error.toString();
+                const errorMessage = error instanceof Error ? error.message.toLowerCase() : String(error).toLowerCase();
+                const errorString = String(error);
                 const isRateLimitError = errorString.includes("429") || errorMessage.includes('rate limit') || errorMessage.includes('resource_exhausted') || errorMessage.includes('quota');
     
                 if (isRateLimitError) {
@@ -428,7 +427,7 @@ export default function ImageCreator() {
             throw new Error("All image models are on cooldown.");
         }
     
-        let lastError: any;
+        let lastError: unknown;
     
         for (const currentModel of availableModels) {
             const apiCall = () => {
@@ -459,13 +458,22 @@ export default function ImageCreator() {
                     showToast(`Successfully used fallback image model: ${currentModel}`, 'success');
                 }
     
-                return response.generatedImages.map(img => ({
-                    bytesBase64Encoded: img.image.imageBytes
+                const images = (response.generatedImages ?? [])
+                    .map(img => img?.image?.imageBytes)
+                    .filter((bytes): bytes is string => typeof bytes === 'string');
+
+                if (images.length === 0 && response.generatedImages && response.generatedImages.length > 0) {
+                    throw new Error("API returned images, but image data could not be extracted.");
+                }
+                
+                return images.map(bytes => ({
+                    bytesBase64Encoded: bytes
                 }));
+
             } catch (error) {
                 lastError = error;
-                const errorMessage = (error?.message || '').toLowerCase();
-                const errorString = error.toString();
+                const errorMessage = error instanceof Error ? error.message.toLowerCase() : String(error).toLowerCase();
+                const errorString = String(error);
                 const isRateLimitError = errorString.includes("429") || errorMessage.includes('rate limit') || errorMessage.includes('resource_exhausted') || errorMessage.includes('quota');
     
                 if (isRateLimitError) {
@@ -516,8 +524,9 @@ export default function ImageCreator() {
                 file_size: data.upscaled_file.size,
             };
         } catch (error) {
-             console.error("Upscale API call failed:", error);
-            showToast(`Upscale error: ${(error as Error).message}`, 'error');
+            console.error("Upscale API call failed:", error);
+            const message = error instanceof Error ? error.message : "An unknown error occurred.";
+            showToast(`Upscale error: ${message}`, 'error');
             throw error;
         }
     }, [fetchWithRetry, showToast]);
@@ -718,7 +727,7 @@ export default function ImageCreator() {
         for (const p of promptsToProcess) {
             try {
                 const predictions = await generateImagesForPrompt(p.prompt, sampleCount);
-                const newCards: [string, CardData][] = predictions.map((pred: any, i: number) => {
+                const newCards: [string, CardData][] = predictions.map((pred, i) => {
                     const id = `${Date.now()}-${i}`;
                     const cardData: CardData = {
                         id,
@@ -816,7 +825,8 @@ export default function ImageCreator() {
             document.body.removeChild(link);
 
         } catch (error) {
-            showToast(`Download failed: ${(error as Error).message}`, 'error');
+            const message = error instanceof Error ? error.message : "An unknown error occurred.";
+            showToast(`Download failed: ${message}`, 'error');
         }
     }, [showToast, imageUrlToDataUrl]);
     
@@ -1018,7 +1028,8 @@ export default function ImageCreator() {
              if (error instanceof SyntaxError) {
                  showToast(`JSON Parse Error: ${error.message}`, 'error');
             } else {
-                 showToast((error as Error).message, 'error');
+                const message = error instanceof Error ? error.message : "An unknown error occurred.";
+                showToast(message, 'error');
             }
         }
     }, [batchInput, showToast]);
@@ -1076,7 +1087,8 @@ export default function ImageCreator() {
 
         } catch (error) {
             console.error("Batch prompt generation failed:", error);
-            showToast(`Failed to generate prompts: ${(error as Error).message}`, 'error');
+            const message = error instanceof Error ? error.message : "An unknown error occurred.";
+            showToast(`Failed to generate prompts: ${message}`, 'error');
         } finally {
             setIsBatchGeneratingPrompts(false);
         }
