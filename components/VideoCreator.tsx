@@ -2,17 +2,21 @@ import React, { useState, useCallback, useEffect, useRef, DragEvent, ChangeEvent
 import { Video, Wand2, Loader, Download, AlertCircle, Check, X, UploadCloud, Trash2 } from 'lucide-react';
 import { GoogleGenAI } from "@google/genai";
 
-// --- SETUP ---
-const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
-
 // --- TYPES & CONSTANTS ---
+
+interface VideoCreatorProps {
+    apiKeys: string[];
+    getNextAvailableKey: () => { key: string | null, index: number };
+    cycleToNextKey: (failedKey: string) => void;
+}
+
 type ToastMessage = {
     id: number;
     message: string;
     type: 'info' | 'success' | 'error';
 };
 
-const VIDEO_MODELS = ['veo-2.0-generate-001', 'veo-3.0-generate-preview'];
+const VIDEO_MODELS = ['veo-2.0-generate-001'];
 const ASPECT_RATIOS = ["16:9", "9:16", "1:1", "4:3", "3:4"];
 
 const loadingMessages = [
@@ -54,7 +58,7 @@ const Toast: React.FC<ToastProps> = ({ toast, onDismiss }) => {
 };
 
 // --- MAIN COMPONENT ---
-export default function VideoCreator() {
+export default function VideoCreator({ apiKeys, getNextAvailableKey, cycleToNextKey }: VideoCreatorProps) {
     const [activeTab, setActiveTab] = useState<'single' | 'batch'>('single');
     const [prompt, setPrompt] = useState('');
     const [batchInput, setBatchInput] = useState('');
@@ -74,6 +78,12 @@ export default function VideoCreator() {
     const showToast = useCallback((message: string, type: 'info' | 'success' | 'error' = 'info') => {
         setToast({ id: Date.now(), message, type });
     }, []);
+    
+    const isRateLimitError = (error: unknown): boolean => {
+        const errorMessage = error instanceof Error ? error.message.toLowerCase() : String(error).toLowerCase();
+        const errorString = String(error);
+        return errorString.includes("429") || errorMessage.includes('rate limit') || errorMessage.includes('resource_exhausted') || errorMessage.includes('quota');
+    };
 
     // Loading message cycle effect
     useEffect(() => {
@@ -102,8 +112,8 @@ export default function VideoCreator() {
             return;
         }
 
-        if (!process.env.API_KEY) {
-            showToast("API key is missing.", 'error');
+        if (apiKeys.length === 0) {
+            showToast("Please add an API key in the settings before generating.", 'error');
             return;
         }
 
@@ -114,63 +124,80 @@ export default function VideoCreator() {
 
         for (const [index, currentPrompt] of promptsToProcess.entries()) {
             showToast(`Processing prompt ${index + 1} of ${promptsToProcess.length}...`, 'info');
-            try {
-                const params: any = {
-                    model,
-                    prompt: currentPrompt,
-                    config: {
-                        numberOfVideos,
-                        aspectRatio
-                    }
-                };
-                if (inputImage) {
-                    params.image = {
-                        imageBytes: inputImage.split(',')[1],
-                        mimeType: inputImage.match(/data:(.*);base64,/)?.[1] || 'image/jpeg',
+            let success = false;
+
+            for (let i = 0; i < apiKeys.length; i++) {
+                const { key: apiKey } = getNextAvailableKey();
+                if (!apiKey) {
+                    showToast("All API keys are on cooldown. Please wait.", 'error');
+                    break; 
+                }
+                
+                try {
+                    const ai = new GoogleGenAI({ apiKey });
+                    const params: any = {
+                        model,
+                        prompt: currentPrompt,
+                        config: { numberOfVideos, aspectRatio }
                     };
+                    if (inputImage) {
+                        params.image = {
+                            imageBytes: inputImage.split(',')[1],
+                            mimeType: inputImage.match(/data:(.*);base64,/)?.[1] || 'image/jpeg',
+                        };
+                    }
+
+                    let operation = await ai.models.generateVideos(params);
+                    showToast("Video generation started. This can take several minutes.", 'info');
+
+                    while (!operation.done) {
+                        await new Promise(resolve => setTimeout(resolve, 10000)); // Poll every 10 seconds
+                        operation = await ai.operations.getVideosOperation({ operation: operation });
+                    }
+
+                    const videoUris = operation.response?.generatedVideos?.map(v => v.video?.uri).filter(Boolean) as string[];
+
+                    if (!videoUris || videoUris.length === 0) {
+                        throw new Error("Video generation completed, but no download link was found.");
+                    }
+
+                    showToast(`Fetching ${videoUris.length} generated video(s)...`, 'info');
+
+                    const fetchedUrls = await Promise.all(
+                        videoUris.map(async (uri) => {
+                            const response = await fetch(`${uri}&key=${apiKey}`);
+                            if (!response.ok) throw new Error(`Failed to fetch video: ${response.statusText}`);
+                            const videoBlob = await response.blob();
+                            return URL.createObjectURL(videoBlob);
+                        })
+                    );
+
+                    setGeneratedVideos(prev => [...prev, ...fetchedUrls]);
+                    showToast(`Prompt ${index + 1} completed successfully!`, 'success');
+                    totalSuccessCount++;
+                    success = true;
+                    break; // Exit key loop on success
+                } catch (error) {
+                    console.error(`Video generation failed for prompt "${currentPrompt.substring(0, 20)}...":`, error);
+                    if (isRateLimitError(error)) {
+                        showToast(`API key failed, trying next...`, 'info');
+                        cycleToNextKey(apiKey);
+                    } else {
+                        const message = error instanceof Error ? error.message : "An unknown error occurred";
+                        showToast(`Error on prompt ${index + 1}: ${message}`, 'error');
+                        break; // Exit key loop for non-retriable errors
+                    }
                 }
-
-                let operation = await ai.models.generateVideos(params);
-                showToast("Video generation started for current prompt. This can take several minutes.", 'info');
-
-                while (!operation.done) {
-                    await new Promise(resolve => setTimeout(resolve, 10000)); // Poll every 10 seconds
-                    operation = await ai.operations.getVideosOperation({ operation: operation });
-                }
-
-                const videoUris = operation.response?.generatedVideos?.map(v => v.video?.uri).filter(Boolean) as string[];
-
-                if (!videoUris || videoUris.length === 0) {
-                    throw new Error("Video generation completed, but no download link was found.");
-                }
-
-                showToast(`Fetching ${videoUris.length} generated video(s) for prompt ${index + 1}...`, 'info');
-
-                const fetchedUrls = await Promise.all(
-                    videoUris.map(async (uri) => {
-                        const response = await fetch(`${uri}&key=${process.env.API_KEY}`);
-                        if (!response.ok) {
-                            throw new Error(`Failed to fetch video: ${response.statusText}`);
-                        }
-                        const videoBlob = await response.blob();
-                        return URL.createObjectURL(videoBlob);
-                    })
-                );
-
-                setGeneratedVideos(prev => [...prev, ...fetchedUrls]);
-                showToast(`Prompt ${index + 1} completed successfully!`, 'success');
-                totalSuccessCount++;
-            } catch (error) {
-                console.error(`Video generation failed for prompt "${currentPrompt.substring(0, 20)}...":`, error);
-                const message = error instanceof Error ? error.message : "An unknown error occurred";
-                showToast(`Error on prompt ${index + 1}: ${message}`, 'error');
+            }
+             if (!success) {
+                showToast(`All API keys failed for prompt ${index + 1}.`, 'error');
             }
         } // End of prompt loop
 
         showToast(`Batch finished. ${totalSuccessCount}/${promptsToProcess.length} prompts succeeded.`, totalSuccessCount > 0 ? 'success' : 'error');
         setIsGenerating(false);
 
-    }, [prompt, batchInput, activeTab, model, numberOfVideos, inputImage, showToast, aspectRatio]);
+    }, [prompt, batchInput, activeTab, model, numberOfVideos, inputImage, showToast, aspectRatio, apiKeys, getNextAvailableKey, cycleToNextKey]);
 
     const handleSurpriseMe = () => {
         const inspirations = [
@@ -305,9 +332,14 @@ export default function VideoCreator() {
                         
                         {/* GENERATE BUTTON */}
                         <div>
+                            {apiKeys.length === 0 && (
+                                <div className="text-center p-2 rounded-md bg-yellow-500/20 text-yellow-300 text-sm mb-2">
+                                    Please add an API key in the settings to enable generation.
+                                </div>
+                            )}
                             <button 
                                 onClick={handleGenerateVideo} 
-                                disabled={isGenerating} 
+                                disabled={isGenerating || apiKeys.length === 0} 
                                 className="w-full py-3 text-lg font-bold bg-gradient-to-r from-sky-600 to-cyan-600 rounded-lg hover:from-sky-700 hover:to-cyan-700 transition-all duration-300 transform hover:scale-[1.01] flex items-center justify-center gap-3 disabled:opacity-50 disabled:cursor-not-allowed">
                                {isGenerating ? (
                                    <>
