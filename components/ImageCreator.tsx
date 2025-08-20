@@ -1,4 +1,4 @@
-
+/// <reference types="node" />
 import React, { useState, useCallback, useRef, useEffect, ChangeEvent, DragEvent, ClipboardEvent } from 'react';
 import { 
     Image as ImageIcon, 

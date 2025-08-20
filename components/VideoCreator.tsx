@@ -1,3 +1,4 @@
+/// <reference types="node" />
 import React, { useState, useCallback, useEffect, useRef, DragEvent, ChangeEvent } from 'react';
 import { Video, Wand2, Loader, Download, AlertCircle, Check, X, UploadCloud, Trash2 } from 'lucide-react';
 import { GoogleGenAI } from "@google/genai";
