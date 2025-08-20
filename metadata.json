@@ -1,0 +1,5 @@
+{
+  "name": "Image Creator by firdausokeh",
+  "description": "An AI-powered application for generating and enhancing images using text prompts. It supports single and batch generation, image-to-prompt, prompt enhancement, and automatic 4x upscaling.",
+  "requestFramePermissions": []
+}
