@@ -1,14 +1,15 @@
 
 import React from 'react';
-import { Image, Video, KeyRound } from 'lucide-react';
+import { Image, Video, Key } from 'lucide-react';
 
 interface NavbarProps {
   activePage: 'image' | 'video';
   onNavigate: (page: 'image' | 'video') => void;
+  isAiStudio: boolean;
   onOpenApiKeyManager: () => void;
 }
 
-const Navbar: React.FC<NavbarProps> = ({ activePage, onNavigate, onOpenApiKeyManager }) => {
+const Navbar: React.FC<NavbarProps> = ({ activePage, onNavigate, isAiStudio, onOpenApiKeyManager }) => {
   const linkClasses = "flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium transition-colors duration-200";
   const activeClasses = "bg-slate-700 text-white";
   const inactiveClasses = "text-slate-400 hover:bg-slate-700/50 hover:text-slate-200";
@@ -38,13 +39,17 @@ const Navbar: React.FC<NavbarProps> = ({ activePage, onNavigate, onOpenApiKeyMan
               <span>Video Creator</span>
             </button>
           </div>
-          <button 
-            onClick={onOpenApiKeyManager} 
-            className="p-2 rounded-full text-slate-300 hover:bg-slate-700/50 hover:text-slate-100 transition"
-            title="Manage API Keys"
-          >
-            <KeyRound className="w-5 h-5" />
-          </button>
+
+          {!isAiStudio && (
+             <button
+              onClick={onOpenApiKeyManager}
+              className="flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium bg-yellow-500/20 text-yellow-300 hover:bg-yellow-500/30 transition-colors duration-200"
+              title="Manage API Keys"
+            >
+              <Key className="w-4 h-4" />
+              <span>Manage Keys</span>
+            </button>
+          )}
         </div>
       </div>
     </nav>

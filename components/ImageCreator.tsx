@@ -1,3 +1,4 @@
+
 import React, { useState, useCallback, useRef, useEffect, ChangeEvent, DragEvent, ClipboardEvent } from 'react';
 import { 
     Image as ImageIcon, 
@@ -22,12 +23,6 @@ import piexif from 'piexifjs';
 import { GoogleGenAI, Type } from "@google/genai";
 
 // --- TYPES & CONSTANTS ---
-
-interface ImageCreatorProps {
-    apiKeys: string[];
-    getNextAvailableKey: () => { key: string | null, index: number };
-    cycleToNextKey: (failedKey: string) => void;
-}
 
 const CATEGORIES: Record<string, string> = {
     "1": "Animals",
@@ -168,7 +163,13 @@ const Toast: React.FC<ToastProps> = ({ toast, onDismiss }) => {
 
 
 // --- MAIN COMPONENT ---
-export default function ImageCreator({ apiKeys, getNextAvailableKey, cycleToNextKey }: ImageCreatorProps) {
+interface ImageCreatorProps {
+    apiKeys: string[];
+    isAiStudio: boolean;
+    openKeyManager: () => void;
+}
+
+export default function ImageCreator({ apiKeys, isAiStudio, openKeyManager }: ImageCreatorProps) {
     // STATE
     const [activeTab, setActiveTab] = useState<'single' | 'batch'>('single');
     const [prompt, setPrompt] = useState('');
@@ -202,19 +203,22 @@ export default function ImageCreator({ apiKeys, getNextAvailableKey, cycleToNext
 
 
     const fileInputRef = useRef<HTMLInputElement>(null);
+    const apiKeyIndex = useRef(0);
     const batchPromptCount = batchInput.split('\n').filter(p => p.trim()).length;
+    const hasValidKey = apiKeys.length > 0;
 
     // --- UTILS ---
     const showToast = useCallback((message: string, type: 'info' | 'success' | 'error' = 'info') => {
         setToast({ id: Date.now(), message, type });
     }, []);
     
-    const isRateLimitError = (error: unknown): boolean => {
-        const errorMessage = error instanceof Error ? error.message.toLowerCase() : String(error).toLowerCase();
-        const errorString = String(error);
-        return errorString.includes("429") || errorMessage.includes('rate limit') || errorMessage.includes('resource_exhausted') || errorMessage.includes('quota');
-    };
-
+    const getApiKey = useCallback(() => {
+        if (apiKeys.length === 0) return null;
+        const key = apiKeys[apiKeyIndex.current];
+        apiKeyIndex.current = (apiKeyIndex.current + 1) % apiKeys.length;
+        return key;
+    }, [apiKeys]);
+    
     const createSeoFilename = (title: string): string => {
         return title
             .replace(/\s*\(4x\s*upscaled\)/gi, '')
@@ -286,10 +290,19 @@ export default function ImageCreator({ apiKeys, getNextAvailableKey, cycleToNext
     };
 
     // --- API CALLS ---
-    const fetchWithRetry = useCallback(async (url: string, options: RequestInit, retries = 3, delay = 1000): Promise<Response> => {
+    const fetchWithRetry = useCallback(async (url: string, options: RequestInit, retries = 3, delay = 1000, timeout = 120000): Promise<Response> => {
         for (let i = 0; i < retries; i++) {
+            const controller = new AbortController();
+            const timeoutId = setTimeout(() => controller.abort(), timeout);
+
             try {
-                const response = await fetch(url, options);
+                const response = await fetch(url, {
+                    ...options,
+                    signal: controller.signal,
+                });
+                
+                clearTimeout(timeoutId);
+
                 if (response.status === 429) { // Too Many Requests
                     console.log(`Rate limited on fetch. Retrying in ${delay / 1000}s... (Attempt ${i + 1})`);
                     await new Promise(res => setTimeout(res, delay * (i + 1))); // Exponential backoff
@@ -301,18 +314,27 @@ export default function ImageCreator({ apiKeys, getNextAvailableKey, cycleToNext
                 }
                 return response;
             } catch (error) {
-                if (i === retries - 1) throw error;
+                clearTimeout(timeoutId);
+                
+                if (error instanceof Error && error.name === 'AbortError') {
+                    console.log(`Request timed out on attempt ${i + 1}.`);
+                }
+
+                if (i === retries - 1) {
+                    if (error instanceof Error && error.name === 'AbortError') {
+                        throw new Error(`Request timed out after ${retries} attempts.`);
+                    }
+                    throw error;
+                }
+                
+                console.log(`Retrying after error... (Attempt ${i + 2})`);
+                await new Promise(res => setTimeout(res, delay * (i + 1)));
             }
         }
         throw new Error('All retries failed.');
     }, []);
 
     const callGeminiApi = useCallback(async (userPrompt: string, schema?: object, multimodal?: { mimeType: string, dataUrl: string } | null) => {
-        if (apiKeys.length === 0) {
-            showToast("Please add an API key in the settings.", 'error');
-            throw new Error("No API key available");
-        }
-    
         const parts: any[] = [];
         if (multimodal) {
             parts.push({
@@ -321,93 +343,70 @@ export default function ImageCreator({ apiKeys, getNextAvailableKey, cycleToNext
         }
         parts.push({ text: userPrompt });
 
-        for (let i = 0; i < apiKeys.length; i++) {
-            const { key: apiKey } = getNextAvailableKey();
-            if (!apiKey) {
-                showToast("All API keys are on cooldown. Please wait.", 'error');
-                throw new Error("All API keys are on cooldown.");
-            }
-
-            try {
-                const ai = new GoogleGenAI({ apiKey });
-                const response = await ai.models.generateContent({
-                    model: 'gemini-2.5-flash',
-                    contents: { parts },
-                    config: schema ? { responseMimeType: "application/json", responseSchema: schema } : undefined,
-                });
-                const text = response.text;
-                if (text === undefined) {
-                    throw new Error("Invalid response structure from Gemini API.");
-                }
-                return text;
-            } catch (error) {
-                if (isRateLimitError(error)) {
-                    showToast(`API key failed, trying next...`, 'info');
-                    cycleToNextKey(apiKey); // Cycle to the next key on rate limit error
-                } else {
-                    const message = error instanceof Error ? error.message : "An unknown error occurred";
-                    showToast(`Gemini API error: ${message}`, 'error');
-                    throw error; // Throw for non-retriable errors
-                }
-            }
+        const apiKey = getApiKey();
+        if (!apiKey) {
+            showToast("No API Key available. Please add one via 'Manage Keys'.", "error");
+            throw new Error("API Key is not configured.");
         }
-        showToast("All available API keys failed. Please check your keys or wait.", 'error');
-        throw new Error("All available API keys failed.");
-    }, [apiKeys, getNextAvailableKey, cycleToNextKey, showToast]);
+
+        try {
+            const ai = new GoogleGenAI({ apiKey });
+            const response = await ai.models.generateContent({
+                model: 'gemini-2.5-flash',
+                contents: { parts },
+                config: schema ? { responseMimeType: "application/json", responseSchema: schema } : undefined,
+            });
+            const text = response.text;
+            if (text === undefined) {
+                throw new Error("Invalid response structure from Gemini API.");
+            }
+            return text;
+        } catch (error) {
+            const message = error instanceof Error ? error.message : "An unknown error occurred";
+            showToast(`Gemini API error: ${message}`, 'error');
+            throw error;
+        }
+    }, [showToast, getApiKey]);
 
     const generateImagesForPrompt = useCallback(async (userPrompt: string, count: number) => {
-        if (apiKeys.length === 0) {
-            showToast("Please add an API key in the settings.", 'error');
-            throw new Error("No API key available");
+        const apiKey = getApiKey();
+        if (!apiKey) {
+            showToast("No API Key available. Please add one via 'Manage Keys'.", "error");
+            throw new Error("API Key is not configured.");
         }
-
-        for (let i = 0; i < apiKeys.length; i++) {
-            const { key: apiKey } = getNextAvailableKey();
-            if (!apiKey) {
-                showToast("All API keys are on cooldown. Please wait.", 'error');
-                throw new Error("All API keys are on cooldown.");
+        
+        try {
+            const ai = new GoogleGenAI({ apiKey });
+            const config: any = {
+                numberOfImages: count,
+                aspectRatio: aspectRatio,
+            };
+            if (model === "imagen-4.0-generate-001" || model === "imagen-4.0-ultra-generate-001") {
+                config.imageSize = "2K";
             }
 
-            try {
-                const ai = new GoogleGenAI({ apiKey });
-                const config: any = {
-                    numberOfImages: count,
-                    aspectRatio: aspectRatio,
-                };
-                if (model === "imagen-4.0-generate-001" || model === "imagen-4.0-ultra-generate-001") {
-                    config.imageSize = "2K";
-                }
+            const response = await ai.models.generateImages({
+                model,
+                prompt: userPrompt + " High quality, sharp details, max resolution.",
+                config,
+            });
+            
+            const images = (response.generatedImages ?? [])
+                .map(img => img?.image?.imageBytes)
+                .filter((bytes): bytes is string => typeof bytes === 'string');
 
-                const response = await ai.models.generateImages({
-                    model,
-                    prompt: userPrompt + " High quality, sharp details, max resolution.",
-                    config,
-                });
-                
-                const images = (response.generatedImages ?? [])
-                    .map(img => img?.image?.imageBytes)
-                    .filter((bytes): bytes is string => typeof bytes === 'string');
-
-                if (images.length === 0 && response.generatedImages && response.generatedImages.length > 0) {
-                    throw new Error("API returned images, but image data could not be extracted.");
-                }
-                
-                return images.map(bytes => ({ bytesBase64Encoded: bytes }));
-
-            } catch (error) {
-                if (isRateLimitError(error)) {
-                    showToast(`API key failed, trying next...`, 'info');
-                    cycleToNextKey(apiKey);
-                } else {
-                    const message = error instanceof Error ? error.message : "An unknown error occurred";
-                    showToast(`Imagen API error: ${message}`, 'error');
-                    throw error;
-                }
+            if (images.length === 0 && response.generatedImages && response.generatedImages.length > 0) {
+                throw new Error("API returned images, but image data could not be extracted.");
             }
+            
+            return images.map(bytes => ({ bytesBase64Encoded: bytes }));
+
+        } catch (error) {
+            const message = error instanceof Error ? error.message : "An unknown error occurred";
+            showToast(`Imagen API error: ${message}`, 'error');
+            throw error;
         }
-        showToast("All available API keys failed. Please check your keys or wait.", 'error');
-        throw new Error("All available API keys failed.");
-    }, [model, aspectRatio, showToast, apiKeys, getNextAvailableKey, cycleToNextKey]);
+    }, [model, aspectRatio, showToast, getApiKey]);
     
     const upscaleImage = useCallback(async (imageDataUrl: string, originalFilename: string, scale: 2 | 4) => {
         const imageBlob = await (await fetch(imageDataUrl)).blob();
@@ -419,7 +418,7 @@ export default function ImageCreator({ apiKeys, getNextAvailableKey, cycleToNext
             const response = await fetchWithRetry(UPSCALE_API_URL, {
                 method: 'POST',
                 body: formData,
-            }, 3, 2000);
+            }, 3, 2000, 120000); // Added 120s timeout for upscale
             const data = await response.json();
             if (!data.success || !data.upscaled_file?.download_url) {
                 throw new Error(data.message || 'Upscale failed');
@@ -627,11 +626,6 @@ export default function ImageCreator({ apiKeys, getNextAvailableKey, cycleToNext
             return;
         }
         
-        if (apiKeys.length === 0) {
-            showToast("Please add an API key in the settings before generating.", "error");
-            return;
-        }
-
         setIsGenerating(true);
         setTempEnhanced(null); // Reset after use
         const generatedCards: CardData[] = [];
@@ -687,7 +681,7 @@ export default function ImageCreator({ apiKeys, getNextAvailableKey, cycleToNext
             showToast('Auto-upscaling complete.', 'success');
         }
 
-    }, [activeTab, prompt, batchInput, sampleCount, generateImagesForPrompt, cards.size, showToast, handleAutoMetadata, autoUpscale, aspectRatio, handleUpscale, apiKeys.length]);
+    }, [activeTab, prompt, batchInput, sampleCount, generateImagesForPrompt, cards.size, showToast, handleAutoMetadata, autoUpscale, aspectRatio, handleUpscale]);
     
     const handleDownloadImage = useCallback(async (card: CardData, format: "jpg" | "png") => {
         try {
@@ -1188,6 +1182,21 @@ export default function ImageCreator({ apiKeys, getNextAvailableKey, cycleToNext
                     </div>
                 </header>
 
+                {!hasValidKey && !isAiStudio && (
+                    <div className="p-4 mb-6 rounded-md bg-yellow-500/20 text-yellow-300 border border-yellow-500/30 flex items-center justify-between">
+                        <div className="flex items-center gap-3">
+                            <AlertCircle className="w-5 h-5"/>
+                            <div>
+                                <p className="font-semibold">No API Key Found</p>
+                                <p className="text-sm">Please add an API key to enable content generation.</p>
+                            </div>
+                        </div>
+                        <button onClick={openKeyManager} className="px-4 py-2 rounded-md bg-yellow-500/30 hover:bg-yellow-500/40 transition text-sm font-semibold">
+                            Add Key
+                        </button>
+                    </div>
+                )}
+
                 {/* TABS */}
                 <div className="flex justify-center mb-6">
                     <div className="bg-slate-900/50 p-1 rounded-lg flex gap-1">
@@ -1213,15 +1222,15 @@ export default function ImageCreator({ apiKeys, getNextAvailableKey, cycleToNext
                                         onPaste={handleImagePaste}
                                         placeholder="e.g., A cinematic shot of a steampunk owl wearing goggles..."
                                         className="w-full bg-slate-900 border border-slate-600 rounded-md p-3 resize-none focus:ring-2 focus:ring-purple-500 focus:border-purple-500 h-40 custom-scrollbar"
-                                        disabled={isGenerating}
+                                        disabled={isGenerating || !hasValidKey}
                                     ></textarea>
                                     {tempEnhanced && <div className="absolute top-2 right-2 text-green-400" title="Prompt has been enhanced"><Check className="w-5 h-5"/></div>}
                                 </div>
                                 <div className="flex gap-2 flex-wrap">
-                                    <button onClick={handleEnhancePrompt} disabled={isEnhancing || isGenerating || apiKeys.length === 0} className="flex-1 flex items-center justify-center gap-2 bg-purple-600 px-4 py-2 rounded-md hover:bg-purple-700 transition disabled:opacity-50 text-sm">
+                                    <button onClick={handleEnhancePrompt} disabled={isEnhancing || isGenerating || !hasValidKey} className="flex-1 flex items-center justify-center gap-2 bg-purple-600 px-4 py-2 rounded-md hover:bg-purple-700 transition disabled:opacity-50 text-sm">
                                         {isEnhancing ? <Loader className="w-4 h-4 animate-spin"/> : <Sparkles className="w-4 h-4"/>} Enhance
                                     </button>
-                                    <button onClick={handleSurpriseMe} disabled={isEnhancing || isGenerating || apiKeys.length === 0} className="flex-1 flex items-center justify-center gap-2 bg-slate-700 px-4 py-2 rounded-md hover:bg-slate-600 transition disabled:opacity-50 text-sm">
+                                    <button onClick={handleSurpriseMe} disabled={isEnhancing || isGenerating || !hasValidKey} className="flex-1 flex items-center justify-center gap-2 bg-slate-700 px-4 py-2 rounded-md hover:bg-slate-600 transition disabled:opacity-50 text-sm">
                                         <Wand2 className="w-4 h-4"/> Surprise Me
                                     </button>
                                 </div>
@@ -1237,13 +1246,13 @@ export default function ImageCreator({ apiKeys, getNextAvailableKey, cycleToNext
                                     onChange={e => setBatchInput(e.target.value)}
                                     placeholder="Enter one prompt per line, or use the auto-generator below."
                                     className="w-full bg-slate-900 border border-slate-600 rounded-md p-3 resize-none focus:ring-2 focus:ring-purple-500 focus:border-purple-500 h-40 custom-scrollbar"
-                                    disabled={isGenerating || isEnhancing || isBatchGeneratingPrompts}
+                                    disabled={isGenerating || isEnhancing || isBatchGeneratingPrompts || !hasValidKey}
                                 ></textarea>
                                 <div className="flex gap-2">
                                     <button onClick={handleParseBatchJson} disabled={isEnhancing || isGenerating || isBatchGeneratingPrompts} className="flex-1 flex items-center justify-center gap-2 bg-slate-700 px-4 py-2 rounded-md hover:bg-slate-600 transition disabled:opacity-50 text-sm">
                                         <FileJson className="w-4 h-4" /> Parse JSON
                                     </button>
-                                    <button onClick={handleEnhanceAllBatch} disabled={isEnhancing || isGenerating || isBatchGeneratingPrompts || batchPromptCount === 0 || apiKeys.length === 0} className="flex-1 flex items-center justify-center gap-2 bg-purple-600 px-4 py-2 rounded-md hover:bg-purple-700 transition disabled:opacity-50 text-sm">
+                                    <button onClick={handleEnhanceAllBatch} disabled={isEnhancing || isGenerating || isBatchGeneratingPrompts || batchPromptCount === 0 || !hasValidKey} className="flex-1 flex items-center justify-center gap-2 bg-purple-600 px-4 py-2 rounded-md hover:bg-purple-700 transition disabled:opacity-50 text-sm">
                                         {isEnhancing ? <Loader className="w-4 h-4 animate-spin"/> : <Sparkles className="w-4 h-4"/>} Enhance All
                                     </button>
                                 </div>
@@ -1252,13 +1261,13 @@ export default function ImageCreator({ apiKeys, getNextAvailableKey, cycleToNext
                                     <h3 className="text-lg font-semibold">Auto-generate Prompts</h3>
                                     <div>
                                         <label htmlFor="autogen-theme" className="block text-sm font-medium text-slate-300 mb-1">Theme (optional)</label>
-                                        <input id="autogen-theme" type="text" value={autoGenTheme} onChange={e => setAutoGenTheme(e.target.value)} placeholder="e.g., cyberpunk animals" className="w-full bg-slate-900 border border-slate-600 rounded-md p-2 focus:ring-2 focus:ring-purple-500" disabled={isBatchGeneratingPrompts || isGenerating || isEnhancing} />
+                                        <input id="autogen-theme" type="text" value={autoGenTheme} onChange={e => setAutoGenTheme(e.target.value)} placeholder="e.g., cyberpunk animals" className="w-full bg-slate-900 border border-slate-600 rounded-md p-2 focus:ring-2 focus:ring-purple-500" disabled={isBatchGeneratingPrompts || isGenerating || isEnhancing || !hasValidKey} />
                                     </div>
                                     <div>
                                         <label htmlFor="autogen-count" className="block text-sm font-medium text-slate-300 mb-1">Quantity ({autoGenCount})</label>
-                                        <input id="autogen-count" type="range" min="1" max="50" value={autoGenCount} onChange={e => setAutoGenCount(parseInt(e.target.value))} className="w-full h-2 bg-slate-700 rounded-lg appearance-none cursor-pointer" disabled={isBatchGeneratingPrompts || isGenerating || isEnhancing} />
+                                        <input id="autogen-count" type="range" min="1" max="50" value={autoGenCount} onChange={e => setAutoGenCount(parseInt(e.target.value))} className="w-full h-2 bg-slate-700 rounded-lg appearance-none cursor-pointer" disabled={isBatchGeneratingPrompts || isGenerating || isEnhancing || !hasValidKey} />
                                     </div>
-                                    <button onClick={handleAutoGenBatchPrompts} disabled={isBatchGeneratingPrompts || isGenerating || isEnhancing || apiKeys.length === 0} className="w-full flex items-center justify-center gap-2 bg-indigo-600 px-4 py-2 rounded-md hover:bg-indigo-700 transition disabled:opacity-50 text-sm">
+                                    <button onClick={handleAutoGenBatchPrompts} disabled={isBatchGeneratingPrompts || isGenerating || isEnhancing || !hasValidKey} className="w-full flex items-center justify-center gap-2 bg-indigo-600 px-4 py-2 rounded-md hover:bg-indigo-700 transition disabled:opacity-50 text-sm">
                                         {isBatchGeneratingPrompts ? <Loader className="w-4 h-4 animate-spin"/> : <Wand2 className="w-4 h-4"/>} Generate Prompts
                                     </button>
                                 </div>
@@ -1294,7 +1303,7 @@ export default function ImageCreator({ apiKeys, getNextAvailableKey, cycleToNext
                                     }
                                 }} accept="image/*" className="hidden" />
                             </div>
-                            <button onClick={handleCreatePromptFromImage} disabled={!uploadedImage || isEnhancing || isGenerating || apiKeys.length === 0} className="w-full flex items-center justify-center gap-2 bg-slate-700 px-4 py-2 rounded-md hover:bg-slate-600 transition disabled:opacity-50 text-sm">
+                            <button onClick={handleCreatePromptFromImage} disabled={!uploadedImage || isEnhancing || isGenerating || !hasValidKey} className="w-full flex items-center justify-center gap-2 bg-slate-700 px-4 py-2 rounded-md hover:bg-slate-600 transition disabled:opacity-50 text-sm">
                                  {isEnhancing && uploadedImage ? <Loader className="w-4 h-4 animate-spin"/> : <Wand2 className="w-4 h-4"/>} Create Prompt
                             </button>
                         </div>
@@ -1343,12 +1352,7 @@ export default function ImageCreator({ apiKeys, getNextAvailableKey, cycleToNext
 
                         {/* MAIN ACTION BUTTON */}
                         <div>
-                             {apiKeys.length === 0 && (
-                                <div className="text-center p-2 rounded-md bg-yellow-500/20 text-yellow-300 text-sm mb-2">
-                                    Please add an API key in the settings to enable generation.
-                                </div>
-                            )}
-                            <button onClick={handleGenerate} disabled={isGenerating || isBatchGeneratingPrompts || apiKeys.length === 0} className="w-full py-3 text-lg font-bold bg-gradient-to-r from-purple-600 to-indigo-600 rounded-lg hover:from-purple-700 hover:to-indigo-700 transition-all duration-300 transform hover:scale-[1.01] flex items-center justify-center gap-3 disabled:opacity-50 disabled:cursor-not-allowed">
+                            <button onClick={handleGenerate} disabled={isGenerating || isBatchGeneratingPrompts || !hasValidKey} className="w-full py-3 text-lg font-bold bg-gradient-to-r from-purple-600 to-indigo-600 rounded-lg hover:from-purple-700 hover:to-indigo-700 transition-all duration-300 transform hover:scale-[1.01] flex items-center justify-center gap-3 disabled:opacity-50 disabled:cursor-not-allowed">
                                {isGenerating ? (
                                    <>
                                    <Loader className="w-6 h-6 animate-spin"/> Generating...
